@@ -1431,6 +1431,10 @@ void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T, int
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         float* l_fcproj = acts.fcproj + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
+        // TODO Ali when we change matmul_forward inside the layers we need to change this
+        // float* l_output_linear = acts.output_linear + B * T * C;
+        // float* l_output_loraA = acts.output_loraA + B * T * R;
+        // float* l_output_loraB = acts.output_loraB + B * T * C;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         float* scratch = acts.output;
