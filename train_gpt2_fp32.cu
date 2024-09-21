@@ -736,7 +736,7 @@ void matmul_forward(float* out,
 }
 
 // Runs the forward pass of the LoRA and the linear and adds the results
-void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float* out_loraB
+void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float* out_loraB,
                     const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
                     int B, int T, int C, int OC, int R) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
@@ -748,10 +748,10 @@ void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float*
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
     matmul_forward_kernel4<<<gridDim, blockDim>>>(out_linear, inp, weight, bias, C, OC);
     // TODO: Ali combine the matmul and lora to run in one kernel
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraA, inp, weight_loraA, bias, C, R);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraB, out_loraA, weight_loraB, bias, R, OC);
-    // We're using residual_forward_kernel for adding the two matrix
-    residual_forward_kernel<<<gridDim, blockDim>>>(out, out_linear, out_loraB, B*T*OC);
+    // matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraA, inp, weight_loraA, bias, C, R);
+    // matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraB, out_loraA, weight_loraB, bias, R, OC);
+    // // We're using residual_forward_kernel for adding the two matrix
+    // residual_forward_kernel<<<gridDim, blockDim>>>(out, out_linear, out_loraB, B*T*OC);
     cudaCheck(cudaGetLastError());
 }
 
@@ -938,8 +938,8 @@ typedef struct {
     float* lnfw; // (C)
     float* lnfb; // (C)
     // LoRA A and B
-    float* loraA; // (V, R)
-    float* loraB; // (R, C)
+    float* wte_loraA; // (V, R)
+    float* wte_loraB; // (R, C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
@@ -965,8 +965,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
     // LoRA A and B
-    param_sizes[16] = Vp * R; // loraA
-    param_sizes[17] = R * C; // loraB
+    param_sizes[16] = Vp * R; // wte_loraA
+    param_sizes[17] = R * C; // wte_loraB
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -988,7 +988,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb, &params->loraA, &params->loraB
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb, &params->wte_loraA, &params->wte_loraB
     };
     float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -998,7 +998,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 21
+#define NUM_ACTIVATION_TENSORS 24
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
@@ -1019,6 +1019,7 @@ typedef struct {
     float* lnf_mean; // (B, T)
     float* lnf_rstd; // (B, T)
 
+
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
@@ -1028,10 +1029,15 @@ typedef struct {
     // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
     // (B, NH, T, T), and (B, T, V) shaped tensors.
     float* output;
+    // LoRA related buffers
+    float* output_linear; // (B, T, C)
+    float* output_loraA; // (B, T, R)
+    float* output_loraB; // (B, T, C)
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
+    size_t R = config.lora_rank_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
@@ -1056,6 +1062,10 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
     act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
+    // LoRA related buffers
+    act_sizes[21] = B * T * C;
+    act_sizes[22] = B * T * R; // output_loraA
+    act_sizes[23] = B * T * C; // output_loraB
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1098,7 +1108,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output, &acts->output_linear,  &acts->output_loraA,  &acts->output_loraB
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
@@ -1840,7 +1850,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_lora_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_lora_forward(&model, val_loader.inputs, val_loader.targets, B, T, model.config.lora_rank_size);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1861,7 +1871,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_lora_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_lora_forward(&model, gen_tokens, NULL, B, T, model.config.lora_rank_size);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1894,7 +1904,7 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_lora_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_lora_forward(&model, train_loader.inputs, train_loader.targets, B, T, model.config.lora_rank_size);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
