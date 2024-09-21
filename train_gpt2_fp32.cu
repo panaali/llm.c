@@ -915,10 +915,11 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    int lora_rank_size; // size of rank for approximation
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 16
+#define NUM_PARAMETER_TENSORS 18
 typedef struct {
     float* wte; // (V, C)
     float* wpe; // (maxT, C)
@@ -936,11 +937,15 @@ typedef struct {
     float* fcprojb; // (L, C)
     float* lnfw; // (C)
     float* lnfb; // (C)
+    // LoRA A and B
+    float* loraA; // (V, R)
+    float* loraB; // (R, C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     int Vp = config.padded_vocab_size;
     int C = config.channels;
+    int R = config.lora_rank_size;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
     param_sizes[0] = Vp * C; // wte
@@ -959,6 +964,9 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
+    // LoRA A and B
+    param_sizes[16] = Vp * R; // loraA
+    param_sizes[17] = R * C; // loraB
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -980,7 +988,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb, &params->loraA, &params->loraB
     };
     float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1326,7 +1334,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 }
 
-void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T, int R) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
