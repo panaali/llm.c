@@ -301,7 +301,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
 
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
+    if (idx < N) { 
         out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
     }
 }
@@ -732,6 +732,26 @@ void matmul_forward(float* out,
     dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
     matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel 1 is the most naive matmul kernel
+void matmul_forward_lora(float* out,
+                    const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
+                    int B, int T, int C, int OC, int R) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    // R is the rank of the low rank approximation in LoRA
+    int sqrt_block_size = 16;
+
+    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
+    dim3 blockDim(sqrt_block_size, sqrt_block_size);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out1, inp, weight, bias, C, OC);
+    // TODO: Ali combine the matmul and lora to run in one kernel
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraA, inp, weight_loraA, bias, C, R);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out2, out_loraA, weight_loraB, bias, R, OC);
+    // We're using 
+    residual_forward_kernel<<<gridDim, blockDim>>>(out, out1, out2);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1306,6 +1326,143 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 }
 
+void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+    // targets are optional and could be NULL
+
+    // ensure the model was initialized or error out
+    if (model->params_memory == NULL) {
+        printf("Error: model was not initialized properly.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // convenience parameters
+    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
+    int L = model->config.num_layers;
+    int NH = model->config.num_heads;
+    int C = model->config.channels;
+
+    // validate inputs, all indices must be in the range [0, V)
+    for(int i = 0; i < B * T; i++) {
+        assert(0 <= inputs[i] && inputs[i] < V);
+        if (targets != NULL) {
+            assert(0 <= targets[i] && targets[i] < V);
+        }
+    }
+
+    // allocate space for all the activations if needed (done here, lazily)
+    if(model->acts_memory == NULL) {
+        // record the current B,T as well
+        model->batch_size = B;
+        model->seq_len = T;
+        // and now allocate the space
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        size_t num_activations = 0;
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            num_activations += model->act_sizes[i];
+        }
+        model->num_activations = num_activations;
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
+        // also create memory for caching inputs and targets
+        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+    } else {
+        // validate B,T is consistent with how we've allocated the memory before
+        // in principle we could get more clever here in the future, for now this is safest
+        if (B != model->batch_size || T != model->seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // copy inputs/targets to the model
+    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    if (targets != NULL) {
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    // forward pass
+    ParameterTensors params = model->params; // for brevity
+    ActivationTensors acts = model->acts;
+    float* residual;
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+
+    for (int l = 0; l < L; l++) {
+
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+
+        // get the pointers of the weights for this layer
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_ln1b = params.ln1b + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_qkvb = params.qkvb + l * 3*C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_attprojb = params.attprojb + l * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_ln2b = params.ln2b + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcb = params.fcb + l * 4*C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        float* l_fcprojb = params.fcprojb + l * C;
+
+        // get the pointers of the activations for this layer
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_attproj = acts.attproj + l * B * T * C;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float* l_fcproj = acts.fcproj + l * B * T * C;
+        float* l_residual3 = acts.residual3 + l * B * T * C;
+        // these are only needed as scratchpads for the forward pass, but
+        // need not be stored for backward
+        float* scratch = acts.output;
+
+        // now do the forward pass
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+    }
+
+    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+    matmul_forward_lora(acts.output, acts.lnf, params.wte, params.wte_loraA, params.wte_loraB, NULL, B, T, C, Vp);
+
+    // also forward the cross-entropy loss function if we have the targets
+    if (targets != NULL) {
+        // fused classifier: does the forward pass and first part of the backward pass
+        // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
+        // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
+        // move the (B,T) losses to CPU
+        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        float mean_loss = 0.0f;
+        for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
+        mean_loss /= B*T;
+        model->mean_loss = mean_loss;
+
+    } else {
+        // if we don't have targets, we don't have loss
+        model->mean_loss = -1.0f;
+    }
+}
+
 void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(float))); }
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
@@ -1671,7 +1828,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_lora_forward(&model, val_loader.inputs, val_loader.targets, B, T);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1692,7 +1849,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_lora_forward(&model, gen_tokens, NULL, B, T);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1725,7 +1882,7 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_lora_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
