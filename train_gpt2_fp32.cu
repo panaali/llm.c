@@ -921,8 +921,8 @@ typedef struct {
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 18
 typedef struct {
-    float* wte; // (V, C)
-    float* wpe; // (maxT, C)
+    float* wte; // (V, C) token embedding
+    float* wpe; // (maxT, C) position embedding
     float* ln1w; // (L, C)
     float* ln1b; // (L, C)
     float* qkvw; // (L, 3*C, C)
@@ -938,7 +938,7 @@ typedef struct {
     float* lnfw; // (C)
     float* lnfb; // (C)
     // LoRA A and B
-    float* wte_loraA; // (V, R)
+    float* wte_loraA; // (Vp, R)
     float* wte_loraB; // (R, C)
 } ParameterTensors;
 
@@ -965,8 +965,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
     // LoRA A and B
-    param_sizes[16] = Vp * R; // wte_loraA
-    param_sizes[17] = R * C; // wte_loraB
+    param_sizes[16] = C * R; // wte_loraA
+    param_sizes[17] = R * Vp; // wte_loraB
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -1030,9 +1030,9 @@ typedef struct {
     // (B, NH, T, T), and (B, T, V) shaped tensors.
     float* output;
     // LoRA related buffers
-    float* output_linear; // (B, T, C)
+    float* output_linear; // (B, T, Vp)
     float* output_loraA; // (B, T, R)
-    float* output_loraB; // (B, T, C)
+    float* output_loraB; // (B, T, Vp)
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
@@ -1063,9 +1063,9 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[19] = L * B * T * 3*C; // qkvr
     act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
     // LoRA related buffers
-    act_sizes[21] = B * T * C;
+    act_sizes[21] = B * T * Vp;
     act_sizes[22] = B * T * R; // output_loraA
-    act_sizes[23] = B * T * C; // output_loraB
+    act_sizes[23] = B * T * Vp; // output_loraB
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
