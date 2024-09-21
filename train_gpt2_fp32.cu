@@ -735,7 +735,7 @@ void matmul_forward(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 1 is the most naive matmul kernel
+// Runs the forward pass of the LoRA and the linear and adds the results
 void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float* out_loraB
                     const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
                     int B, int T, int C, int OC, int R) {
