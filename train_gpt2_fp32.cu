@@ -736,7 +736,7 @@ void matmul_forward(float* out,
 }
 
 // kernel 1 is the most naive matmul kernel
-void matmul_forward_lora(float* out,
+void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float* out_loraB
                     const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
                     int B, int T, int C, int OC, int R) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
@@ -746,12 +746,12 @@ void matmul_forward_lora(float* out,
 
     dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out1, inp, weight, bias, C, OC);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_linear, inp, weight, bias, C, OC);
     // TODO: Ali combine the matmul and lora to run in one kernel
     matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraA, inp, weight_loraA, bias, C, R);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out2, out_loraA, weight_loraB, bias, R, OC);
-    // We're using 
-    residual_forward_kernel<<<gridDim, blockDim>>>(out, out1, out2);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraB, out_loraA, weight_loraB, bias, R, OC);
+    // We're using residual_forward_kernel for adding the two matrix
+    residual_forward_kernel<<<gridDim, blockDim>>>(out, out_linear, out_loraB, B*T*OC);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1442,7 +1442,7 @@ void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_lora(acts.output, acts.lnf, params.wte, params.wte_loraA, params.wte_loraB, NULL, B, T, C, Vp, R);
+    matmul_forward_lora(acts.output, acts.output_linear, acts.output_loraA, acts.output_loraB, acts.lnf, params.wte, params.wte_loraA, params.wte_loraB, NULL, B, T, C, Vp, R);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
