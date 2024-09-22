@@ -735,49 +735,6 @@ void matmul_forward(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// // Runs the forward pass of the LoRA and the linear and adds the results
-// void matmul_forward_lora(float* out, float* out_linear, float* out_loraA, float* out_loraB,
-//                     const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
-//                     int B, int T, int C, int OC, int R) {
-
-void matmul_forward_lora_backup(float* out, float* out_loraA,
-                    const float* inp, const float* weight, const float* weight_loraA, const float* bias,
-                    int B, int T, int C, int OC, int R) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // R is the rank of the low rank approximation in LoRA
-    int sqrt_block_size = 16;
-    // copy the weight_loraA from device to host and check all is zero
-    float* weight_loraA_host = (float*)malloc(C * R * sizeof(float));
-    cudaMemcpy(weight_loraA_host, weight_loraA, C * R * sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < C * R; i++) {
-        assert(weight_loraA_host[i] == 0.0f && "weight_loraA should be all zeros");
-    }
-    free(weight_loraA_host);
-    // printf("weight_loraA_host: %f", weight_loraA_host[0]);
-    // copy out_loraA from device to host and print sum of all elements
-    float* out_loraA_host = (float*)malloc(C * R * sizeof(float));
-    cudaMemcpy(out_loraA_host, out_loraA, C * R * sizeof(float), cudaMemcpyDeviceToHost);
-    float sum = 0.0f;
-    for (int i = 0; i < C * R; i++) {
-        sum += out_loraA_host[i];
-        assert(out_loraA_host[i] == 0.0f && "out_loraA should be all zeros");
-    }
-    // printf("out_loraA_host: %f", sum);
-    free(out_loraA_host);
-
-    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
-    dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
-    // TODO: Ali combine the matmul and lora to run in one kernel
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraA, inp, weight_loraA, NULL, C, R);
-    // matmul_forward_kernel4<<<gridDim, blockDim>>>(out_loraB, out_loraA, weight_loraB, bias, R, OC);
-    // // We're using residual_forward_kernel for adding the two matrix
-    // residual_forward_kernel<<<gridDim, blockDim>>>(out, out_linear, out_loraB, B*T*OC);
-    cudaCheck(cudaGetLastError());
-}
-
-
 void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
@@ -836,6 +793,7 @@ void matmul_forward_lora(float* out, float* out_loraA, float* out_loraB,
                          const float* inp, const float* weight, const float* weight_loraA, const float* weight_loraB, const float* bias,
                          int B, int T, int C, int OC, int R) {
     // Main linear transformation
+    // TODO: Ali: we might need out_linear for the backward pass
     matmul_forward(out, inp, weight, bias, B, T, C, OC);
     
     // LoRA A matrix multiplication
@@ -1531,8 +1489,6 @@ void gpt2_lora_forward(GPT2 *model, int* inputs, int* targets, int B, int T, int
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    // matmul_forward_lora(acts.output, acts.output_linear, acts.output_loraA, acts.output_loraB, acts.lnf, params.wte, params.wte_loraA, params.wte_loraB, NULL, B, T, C, Vp, R);
-    // matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
     matmul_forward_lora(acts.output, acts.output_loraA, acts.output_loraB, acts.lnf, params.wte, params.wte_loraA, params.wte_loraB, NULL, B, T, C, Vp, R);
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
